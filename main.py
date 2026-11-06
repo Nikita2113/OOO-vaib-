@@ -135,15 +135,12 @@ class TerrainMap:
         try:
             import numpy as np
             arr = pygame.surfarray.pixels3d(self.surface)  # (w, h, 3)
+            alpha = pygame.surfarray.pixels_alpha(self.surface)  # (w, h)
             solid = np.array(self.map, dtype=bool).T       # (w, h)
             n1 = np.array(value_noise_2d(w, h, self.seed, 7)).T
             n2 = np.array(value_noise_2d(w, h, self.seed + 999, 23)).T
-            idx = np.arange(h)
-            cum = solid.cumsum(axis=1)
-            first = np.argmax(solid, axis=1)
-            depth = np.where(solid, idx[None, :] - first[None, :] + 1 + (cum - cum.max(axis=1, keepdims=True)), 0)
-            # корректная глубина сверху вниз:
-            colrun = np.zeros_like(cum)
+            # корректная глубина сверху вниз (непрерывный вертикальный прогон):
+            colrun = np.zeros((w, h), dtype=int)
             run = np.zeros(w, dtype=int)
             for y in range(h):
                 run = np.where(solid[:, y], run + 1, 0)
@@ -172,14 +169,68 @@ class TerrainMap:
             below_solid[:, :-1] = solid[:, 1:]
             bottom_edge = solid & ~below_solid & (dp > grass_h)
             r *= 1 - bottom_edge * 0.4; g *= 1 - bottom_edge * 0.4; b *= 1 - bottom_edge * 0.4
-            # тёмная кромка под травой
-            under_grass = solid & (dp == grass_h) & ~is_grass_shift(solid, grass_h)
-            arr[..., 0] = np.where(solid, np.clip(r, 0, 255), arr[..., 0]).astype(np.uint8)
-            arr[..., 1] = np.where(solid, np.clip(g, 0, 255), arr[..., 1]).astype(np.uint8)
-            arr[..., 2] = np.where(solid, np.clip(b, 0, 255), arr[..., 2]).astype(np.uint8)
-            del arr
+            # тёмная кромка под слоем травы
+            under_grass = (dp == grass_h) & ~np.roll(is_grass, -1, axis=1) & is_grass
+            r = np.where(under_grass, r * 0.75, r)
+            g = np.where(under_grass, g * 0.75, g)
+            b = np.where(under_grass, b * 0.75, b)
+            arr[..., 0] = np.where(solid, np.clip(r, 0, 255), 0).astype(np.uint8)
+            arr[..., 1] = np.where(solid, np.clip(g, 0, 255), 0).astype(np.uint8)
+            arr[..., 2] = np.where(solid, np.clip(b, 0, 255), 0).astype(np.uint8)
+            alpha[...] = np.where(solid, 255, 0).astype(np.uint8)
+            del arr, alpha
         except Exception:
             self._rebuild_surface_slow()
+
+    def _rebuild_surface_slow(self):
+        """★ Резервный попиксельный рендер террейна (без numpy)."""
+        w, h = self.width, self.height
+        grass_h = max(4, min(8, int(6 * h / 750)))
+        noise_scale1, noise_scale2 = 7.0, 23.0
+        rnd = random.Random(self.seed)
+        # шум можно взять из value_noise_2d, но он тяжёлый — используем дешёвый хэш-шум
+        def cheap_noise(x, y, seed_off):
+            v = ((x * 73856093) ^ (y * 19349663) ^ ((self.seed + seed_off) * 83492791)) & 0xFFFFFFFF
+            return (v % 1000) / 1000.0
+        for x in range(w):
+            run = 0
+            for y in range(h):
+                if not self.map[y][x]:
+                    run = 0
+                    continue
+                run += 1
+                dp = run
+                n1 = cheap_noise(x, y, 0)
+                n2 = cheap_noise(x, y, 999)
+                shade = 0.82 + (n1 * 0.6 + n2 * 0.4) * 0.36
+                deep_fade = max(0.55, 1.0 - max(0, dp - grass_h * 3) * 0.004)
+                rockness = min(1.0, max(0.0, (dp - grass_h * 2) / max(1.0, h * 0.35)))
+                tip = 1.0 if dp <= 2 else 0.94
+                is_grass = dp <= grass_h
+                if is_grass:
+                    r0, g0, b0 = self.color[0] * tip, self.color[1] * tip, self.color[2] * tip
+                else:
+                    br_, bg_, bb_ = self.dirt_color
+                    r0 = br_ * (1 - rockness) + 105 * rockness
+                    g0 = bg_ * (1 - rockness) + 98 * rockness
+                    b0 = bb_ * (1 - rockness) + 92 * rockness
+                    if n2 > 0.78 and rockness > 0.3:
+                        r0 += 28; g0 += 26; b0 += 24
+                k = shade * deep_fade
+                r0 *= k; g0 *= k; b0 *= k
+                left_edge = x > 0 and self.map[y][x] and not self.map[y][max(0, x - 1)]
+                right_edge = x < w - 1 and self.map[y][x] and not self.map[y][min(w - 1, x + 1)]
+                if left_edge:
+                    r0 += 18; g0 += 16; b0 += 12
+                if right_edge:
+                    r0 *= 0.8; g0 *= 0.8; b0 *= 0.8
+                below_solid = y < h - 1 and self.map[min(y + 1, h - 1)][x]
+                if not below_solid and dp > grass_h:
+                    r0 *= 0.6; g0 *= 0.6; b0 *= 0.6
+                r = int(max(0, min(255, r0)))
+                g = int(max(0, min(255, g0)))
+                b = int(max(0, min(255, b0)))
+                self.surface.set_at((x, y), (r, g, b, 255))
 
         # ★ Травиночки и цветы поверх кромки
         for dec in self.decorations:
