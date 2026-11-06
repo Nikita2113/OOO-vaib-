@@ -20,16 +20,62 @@ MAX_CLIMB_HEIGHT = 40  # ★ Макс высота которую может п�
 PARACHUTE_DRIFT = 1.8
 
 
+# ======== ★ ГРАФИЧЕСКИЕ УТИЛИТЫ (аддитивное свечение, шум, градиенты) ========
+
+def _additive_layer(size):
+    return pygame.Surface(size, pygame.SRCALPHA)
+
+
+def glow_dot(layer, x, y, radius, color, core_alpha=180):
+    """Мягкое световое пятно (рисуются в аддитивный слой)."""
+    r = max(2, int(radius))
+    s = _additive_layer((r * 2, r * 2))
+    cx = cy = r
+    for rr in range(r, 0, -max(1, r // 8)):
+        a = int(core_alpha * (rr / r) ** 2)
+        pygame.draw.circle(s, (*color, min(255, a)), (cx, cy), rr)
+    layer.blit(s, (int(x) - r, int(y) - r), special_flags=pygame.BLEND_PREMULTIPLIED)
+
+
+def draw_glow_circle(surface, pos, radius, color, core_alpha=200):
+    """Светящийся круг поверх сцены."""
+    layer = _additive_layer(surface.get_size())
+    glow_dot(layer, pos[0], pos[1], radius, color, core_alpha)
+    surface.blit(layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+
+def value_noise_2d(w, h, seed, scale):
+    """Простый целочисленный шум значений с билинейной интерполяцией."""
+    rng = random.Random(seed)
+    gw, gh = max(2, w // scale + 2), max(2, h // scale + 2)
+    grid = [[rng.random() for _ in range(gw)] for _ in range(gh)]
+
+    def smooth(t):
+        return t * t * (3 - 2 * t)
+
+    out = [[0.0] * w for _ in range(h)]
+    for y in range(h):
+        gy, fy = y // scale, smooth((y % scale) / scale)
+        for x in range(w):
+            gx, fx = x // scale, smooth((x % scale) / scale)
+            v00 = grid[gy][gx]; v10 = grid[gy][min(gx + 1, gw - 1)]
+            v01 = grid[min(gy + 1, gh - 1)][gx]; v11 = grid[min(gy + 1, gh - 1)][min(gx + 1, gw - 1)]
+            out[y][x] = (v00 * (1 - fx) + v10 * fx) * (1 - fy) + (v01 * (1 - fx) + v11 * fx) * fy
+    return out
+
+
 class TerrainMap:
-    def __init__(self, width, height, color, dark_color=None):
+    def __init__(self, width, height, color, dark_color=None, dirt_color=None):
         self.width = max(1, width)
         self.height = max(1, height)
         self.color = color
+        self.dirt_color = dirt_color or tuple(max(0, c - 45) for c in (color[0] + 40, color[1] + 5, color[2] - 15))
         self.dark_color = dark_color or tuple(max(0, c - 40) for c in color)
         self.map = [[False] * self.width for _ in range(self.height)]
         self.surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         self.dirty = True
         self.decorations = []
+        self.seed = random.randint(0, 10 ** 9)
 
     def set_solid(self, x, y, value=True):
         if 0 <= x < self.width and 0 <= y < self.height:
@@ -82,36 +128,82 @@ class TerrainMap:
                     break
 
     def rebuild_surface(self):
+        """★ Полная перерисовка с травою, землёй с шумом, скалами, тенями и подсветкой."""
         if not self.dirty: return
+        w, h = self.width, self.height
         self.surface.fill((0, 0, 0, 0))
-        dark = self.dark_color
-        for y in range(self.height):
-            row = self.map[y]
-            x = 0
-            while x < self.width:
-                if row[x]:
-                    start = x
-                    while x < self.width and row[x]: x += 1
-                    pygame.draw.rect(self.surface, self.color, (start, y, x - start, 1))
-                    if y == 0 or not self.map[y - 1][start]:
-                        pygame.draw.rect(self.surface, dark, (start, y, x - start, 1))
-                else:
-                    x += 1
+        try:
+            import numpy as np
+            arr = pygame.surfarray.pixels3d(self.surface)  # (w, h, 3)
+            solid = np.array(self.map, dtype=bool).T       # (w, h)
+            n1 = np.array(value_noise_2d(w, h, self.seed, 7)).T
+            n2 = np.array(value_noise_2d(w, h, self.seed + 999, 23)).T
+            idx = np.arange(h)
+            cum = solid.cumsum(axis=1)
+            first = np.argmax(solid, axis=1)
+            depth = np.where(solid, idx[None, :] - first[None, :] + 1 + (cum - cum.max(axis=1, keepdims=True)), 0)
+            # корректная глубина сверху вниз:
+            colrun = np.zeros_like(cum)
+            run = np.zeros(w, dtype=int)
+            for y in range(h):
+                run = np.where(solid[:, y], run + 1, 0)
+                colrun[:, y] = run
+            dp = colrun
+            grass_h = max(4, min(8, int(6 * h / 750)))
+            shade = 0.82 + (n1 * 0.6 + n2 * 0.4) * 0.36
+            deep_fade = np.clip(1.0 - np.maximum(0, dp - grass_h * 3) * 0.004, 0.55, 1.0)
+            rockness = np.clip((dp - grass_h * 2) / max(1.0, h * 0.35), 0, 1)
+            tip = np.where(dp <= 2, 1.0, 0.94)
+            is_grass = dp <= grass_h
+            br_, bg_, bb_ = self.dirt_color
+            gr_, gg_, gb_ = self.color
+            r = np.where(is_grass, gr_ * tip, br_ * (1 - rockness) + 105 * rockness)
+            g = np.where(is_grass, gg_ * tip, bg_ * (1 - rockness) + 98 * rockness)
+            b = np.where(is_grass, gb_ * tip, bb_ * (1 - rockness) + 92 * rockness)
+            r, g, b = r * shade * deep_fade, g * shade * deep_fade, b * shade * deep_fade
+            veins = (~is_grass) & (n2 > 0.78) & (rockness > 0.3)
+            r += veins * 28; g += veins * 26; b += veins * 24
+            left_edge = solid & ~np.roll(solid, 1, axis=0)
+            right_edge = solid & ~np.roll(solid, -1, axis=0)
+            left_edge[:, 0] = False; right_edge[:, w - 1] = False
+            r += left_edge * 18; g += left_edge * 16; b += left_edge * 12
+            r *= 1 - right_edge * 0.2; g *= 1 - right_edge * 0.2; b *= 1 - right_edge * 0.2
+            below_solid = np.zeros_like(solid)
+            below_solid[:, :-1] = solid[:, 1:]
+            bottom_edge = solid & ~below_solid & (dp > grass_h)
+            r *= 1 - bottom_edge * 0.4; g *= 1 - bottom_edge * 0.4; b *= 1 - bottom_edge * 0.4
+            # тёмная кромка под травой
+            under_grass = solid & (dp == grass_h) & ~is_grass_shift(solid, grass_h)
+            arr[..., 0] = np.where(solid, np.clip(r, 0, 255), arr[..., 0]).astype(np.uint8)
+            arr[..., 1] = np.where(solid, np.clip(g, 0, 255), arr[..., 1]).astype(np.uint8)
+            arr[..., 2] = np.where(solid, np.clip(b, 0, 255), arr[..., 2]).astype(np.uint8)
+            del arr
+        except Exception:
+            self._rebuild_surface_slow()
+
+        # ★ Травиночки и цветы поверх кромки
         for dec in self.decorations:
             if dec[0] == 'grass':
-                _, dx, dy, h = dec
+                _, dx, dy, hgt = dec
                 if dy < self.height and not self.map[dy][dx]:
-                    pygame.draw.line(self.surface, (50, 140, 50), (dx, dy), (dx - 2, dy - h), 1)
-                    pygame.draw.line(self.surface, (50, 140, 50), (dx, dy), (dx + 2, dy - h + 1), 1)
+                    sway = math.sin((dx + self.seed % 100) * 0.3) * 1.5
+                    gc = (random.Random(dx * 7 + dy).choice([(50, 150, 55), (70, 170, 65), (90, 185, 80)]))
+                    pygame.draw.line(self.surface, gc, (dx, dy + 1), (dx - 2 + sway, dy - hgt), 1)
+                    pygame.draw.line(self.surface, gc, (dx, dy + 1), (dx + 2 + sway, dy - hgt + 1), 1)
             elif dec[0] == 'rock':
                 _, dx, dy, s = dec
                 if dy - s > 0 and not self.map[dy - s][dx]:
-                    pygame.draw.circle(self.surface, (130, 120, 110), (dx, dy - s // 2), s)
+                    pygame.draw.circle(self.surface, (130, 122, 112), (dx, dy - s // 2), s)
+                    pygame.draw.circle(self.surface, (165, 158, 148), (dx - s // 3, dy - s // 2 - s // 3), max(1, s // 2))
             elif dec[0] == 'flower':
                 _, dx, dy, c = dec
                 if dy - 5 > 0 and not self.map[dy - 5][dx]:
                     pygame.draw.line(self.surface, (50, 130, 50), (dx, dy), (dx, dy - 4), 1)
-                    pygame.draw.circle(self.surface, c, (dx, dy - 5), 2)
+                    for pa in range(0, 360, 72):  # ★ лепестки
+                        ar = math.radians(pa)
+                        pygame.draw.circle(self.surface, c,
+                                           (int(dx + math.cos(ar) * 2), int(dy - 5 + math.sin(ar) * 2)), 1)
+                    pygame.draw.circle(self.surface, (255, 240, 120), (dx, dy - 5), 1)
         self.dirty = False
 
     def get_surface(self):
@@ -150,12 +242,16 @@ class Worm:
         sx, sy = int(self.x - cam_x), int(self.y - cam_y)
         if sx < -50 or sx > SCREEN_W + 50 or sy < -50 or sy > SCREEN_H + 50: return
 
+        t = pygame.time.get_ticks() / 200
+        breathe = math.sin(t * 1.3 + self.x * 0.05) * 0.7  # ★ дыхание в простое
+
         if self.parachute:
-            t = pygame.time.get_ticks() / 200
             sw = math.sin(t) * 2
-            pygame.draw.arc(surface, (255, 255, 255), (sx - 18 + sw, sy - 38, 36, 24), 0, math.pi, 2)
-            pygame.draw.line(surface, (200, 200, 200), (sx - 14 + sw, sy - 18), (sx, sy - 5), 1)
-            pygame.draw.line(surface, (200, 200, 200), (sx + 14 + sw, sy - 18), (sx, sy - 5), 1)
+            pc = tuple(min(255, c + 60) for c in self.color)
+            pygame.draw.arc(surface, pc, (sx - 19 + sw, sy - 39, 38, 26), 0, math.pi, 4)
+            pygame.draw.arc(surface, (255, 255, 255), (sx - 19 + sw, sy - 39, 38, 26), 0.3, math.pi - 0.3, 1)
+            pygame.draw.line(surface, (220, 220, 220), (sx - 14 + sw, sy - 18), (sx, sy - 5), 1)
+            pygame.draw.line(surface, (220, 220, 220), (sx + 14 + sw, sy - 18), (sx, sy - 5), 1)
 
         lo = math.sin(self.walk_frame * math.pi / 2) * 3
         if self.on_ground:
@@ -167,34 +263,57 @@ class Worm:
             pygame.draw.rect(surface, (60, 60, 60), (sx - 5, sy + 8, 4, 6))
             pygame.draw.rect(surface, (60, 60, 60), (sx + 1, sy + 8, 4, 6))
 
-        pygame.draw.ellipse(surface, self.color, (sx - 8, sy - 5, 16, 20))
-        pygame.draw.ellipse(surface, tuple(max(0, c - 30) for c in self.color), (sx - 8, sy - 5, 16, 20), 2)
+        # ★ Тело с градиентом: база + тёмный низ + светлый верх-блик
+        body = (sx - 8, sy - 5, 16, 20 + int(breathe))
+        pygame.draw.ellipse(surface, self.color, body)
+        dark_c = tuple(max(0, c - 55) for c in self.color)
+        light_c = tuple(min(255, c + 55) for c in self.color)
+        pygame.draw.ellipse(surface, dark_c, (sx - 7, sy + 5, 14, 9))
+        pygame.draw.ellipse(surface, light_c, (sx - 5, sy - 4, 10, 7))
+        pygame.draw.ellipse(surface, dark_c, body, 2)  # контур
 
+        # ★ Базука/палка с направлением и колёсиком прицела
+        gun_y = sy - 3 + int(math.sin(self.angle) * 4)
         if self.direction == 1:
-            pygame.draw.line(surface, (255, 213, 176), (sx + 5, sy), (sx + 12, sy - 3), 3)
-            pygame.draw.rect(surface, (80, 80, 80), (sx + 10, sy - 5, 8, 3))
+            pygame.draw.line(surface, (255, 213, 176), (sx + 5, sy), (sx + 12, gun_y), 3)
+            pygame.draw.rect(surface, (90, 90, 95), (sx + 10, gun_y - 3, 10, 4))
+            pygame.draw.rect(surface, (55, 55, 60), (sx + 10, gun_y - 3, 10, 4), 1)
+            pygame.draw.circle(surface, (140, 140, 150), (sx + 11, gun_y - 1), 2)
         else:
-            pygame.draw.line(surface, (255, 213, 176), (sx - 5, sy), (sx - 12, sy - 3), 3)
-            pygame.draw.rect(surface, (80, 80, 80), (sx - 18, sy - 5, 8, 3))
+            pygame.draw.line(surface, (255, 213, 176), (sx - 5, sy), (sx - 12, gun_y), 3)
+            pygame.draw.rect(surface, (90, 90, 95), (sx - 20, gun_y - 3, 10, 4))
+            pygame.draw.rect(surface, (55, 55, 60), (sx - 20, gun_y - 3, 10, 4), 1)
+            pygame.draw.circle(surface, (140, 140, 150), (sx - 11, gun_y - 1), 2)
 
-        pygame.draw.circle(surface, (255, 213, 176), (sx, sy - 12), 9)
+        # ★ Голова с бликом + берёт командного цвета
+        hc = (255, 213, 176)
+        pygame.draw.circle(surface, hc, (sx, sy - 12), 9)
+        pygame.draw.circle(surface, (255, 235, 210), (sx - 3, sy - 15), 3)
+        pygame.draw.circle(surface, tuple(max(0, c - 60) for c in hc), (sx, sy - 12), 9, 1)
         pygame.draw.arc(surface, self.color, (sx - 9, sy - 21, 18, 12), 0, math.pi, 3)
+        pygame.draw.arc(surface, tuple(min(255, c + 50) for c in self.color), (sx - 9, sy - 22, 18, 12), 0.4,
+                        math.pi - 0.4, 1)
         ex = sx + self.direction * 3
         pygame.draw.circle(surface, (255, 255, 255), (ex - 2, sy - 14), 3)
         pygame.draw.circle(surface, (255, 255, 255), (ex + 2, sy - 14), 3)
         pygame.draw.circle(surface, (0, 0, 0), (ex - 2 + self.direction, sy - 14), 1)
         pygame.draw.circle(surface, (0, 0, 0), (ex + 2 + self.direction, sy - 14), 1)
+        # ★ Рот-улыбка по направлению
+        pygame.draw.arc(surface, (120, 70, 50), (ex - 4, sy - 10, 8, 6), math.pi, math.pi * 2, 1)
 
         if self.health < 100:
             bw, hw = 26, int(26 * self.health / 100)
             pygame.draw.rect(surface, (0, 0, 0), (sx - 13, sy - 30, bw + 2, 6))
-            hc = (0, 200, 0) if self.health > 50 else (255, 165, 0) if self.health > 25 else (255, 0, 0)
-            pygame.draw.rect(surface, hc, (sx - 12, sy - 29, hw, 4))
+            hc2 = (0, 200, 0) if self.health > 50 else (255, 165, 0) if self.health > 25 else (255, 0, 0)
+            pygame.draw.rect(surface, hc2, (sx - 12, sy - 29, hw, 4))
+            pygame.draw.rect(surface, tuple(min(255, c + 80) for c in hc2), (sx - 12, sy - 29, hw, 1))
 
         if is_active:
             b = math.sin(pygame.time.get_ticks() / 200) * 3
-            pygame.draw.polygon(surface, (255, 215, 0),
-                                [(sx, sy - 38 + b), (sx - 6, sy - 46 + b), (sx + 6, sy - 46 + b)])
+            pts = [(sx, sy - 38 + b), (sx - 6, sy - 46 + b), (sx + 6, sy - 46 + b)]
+            pygame.draw.polygon(surface, (255, 215, 0), pts)
+            pygame.draw.polygon(surface, (255, 255, 180), [(sx - 2, sy - 40 + b), (sx - 5, sy - 45 + b),
+                                                           (sx + 1, sy - 44 + b)])
             f = pygame.font.Font(None, 16)
             nt = f.render(self.name, True, (255, 255, 255))
             br = nt.get_rect(center=(sx, sy - 55))
@@ -229,7 +348,7 @@ class Projectile:
 # ======== ГЕНЕРАТОРЫ ========
 
 def generate_classic_hills(width, height):
-    terrain = TerrainMap(width, height, (85, 130, 65), (65, 100, 45))
+    terrain = TerrainMap(width, height, (95, 165, 70), (65, 100, 45), (121, 84, 55))
     scale = width / 1400
     num_hills = max(3, int(6 * scale + random.randint(0, 3)))
     for _ in range(num_hills):
@@ -278,7 +397,7 @@ def generate_classic_hills(width, height):
 
 
 def generate_islands(width, height):
-    terrain = TerrainMap(width, height, (80, 140, 70), (60, 110, 50))
+    terrain = TerrainMap(width, height, (90, 170, 78), (60, 110, 50), (115, 82, 52))
     scale = width / 1400
     islands = [(int(width * 0.15), int(width * 0.35)), (int(width * 0.4), int(width * 0.6)),
                (int(width * 0.65), int(width * 0.85))]
@@ -314,7 +433,7 @@ def generate_islands(width, height):
 
 
 def generate_valley(width, height):
-    terrain = TerrainMap(width, height, (110, 100, 70), (85, 75, 50))
+    terrain = TerrainMap(width, height, (150, 140, 95), (85, 75, 50), (118, 92, 60))
     for x in range(max(0, int(width * 0.05)), min(width, int(width * 0.35))):
         dist = abs(x - int(width * 0.2));
         half = max(1, width * 0.15)
@@ -353,11 +472,14 @@ def generate_valley(width, height):
 
 MAPS = [
     {"name": "Classic Hills", "desc": "Rolling hills & caves", "generator": generate_classic_hills,
-     "terrain_color": (85, 130, 65), "sky_top": (30, 60, 140), "sky_bottom": (120, 180, 240)},
+     "terrain_color": (85, 130, 65), "sky_top": (24, 52, 128), "sky_bottom": (140, 195, 245),
+     "dirt_color": (121, 84, 55), "mountain_far": (70, 90, 140), "mountain_near": (52, 74, 112)},
     {"name": "Islands", "desc": "Three close islands", "generator": generate_islands,
-     "terrain_color": (80, 140, 70), "sky_top": (20, 40, 100), "sky_bottom": (80, 160, 230)},
+     "terrain_color": (80, 140, 70), "sky_top": (16, 36, 96), "sky_bottom": (95, 175, 240),
+     "dirt_color": (115, 82, 52), "mountain_far": (60, 88, 130), "mountain_near": (45, 70, 105)},
     {"name": "Valley", "desc": "Hills with valley", "generator": generate_valley,
-     "terrain_color": (110, 100, 70), "sky_top": (60, 40, 100), "sky_bottom": (180, 140, 200)},
+     "terrain_color": (110, 100, 70), "sky_top": (52, 32, 96), "sky_bottom": (200, 150, 190),
+     "dirt_color": (118, 92, 60), "mountain_far": (105, 80, 130), "mountain_near": (80, 58, 105)},
 ]
 
 # ★ УВЕЛИЧЕННЫЕ СКОРОСТИ — снаряды летят дальше!
@@ -413,8 +535,111 @@ def boom_particles(particles, cx, cy):
                           'color': random.choice([(255, 100, 0), (255, 200, 0), (255, 50, 0), (255, 255, 100)])})
 
 
+class ExplosionFX:
+    """★ Красивые многослойные взрывы: вспышка, огненный шар, ударная волна, дым, искры, воронка."""
+
+    def __init__(self, x, y, radius, parts=None):
+        self.x, self.y, self.r = x, y, radius
+        self.t = 0
+        self.duration = 48
+        self.flash_r = radius * 3.2
+        self.wave_r = radius * 2.6
+        self.smoke = []
+        rng = random.Random(int(x * 131 + y))
+        for i in range(max(8, int(radius / 3))):
+            a = rng.uniform(0, math.pi * 2)
+            sp = rng.uniform(0.4, 1.8)
+            self.smoke.append({'x': x + rng.uniform(-radius * 0.4, radius * 0.4),
+                               'y': y + rng.uniform(-radius * 0.4, radius * 0.4),
+                               'vx': math.cos(a) * sp, 'vy': math.sin(a) * sp - rng.uniform(0.5, 1.6),
+                               'r': rng.uniform(radius * 0.18, radius * 0.5),
+                               'delay': rng.randint(0, 10)})
+        self.sparks = []
+        for i in range(max(10, int(radius / 2))):
+            a = rng.uniform(0, math.pi * 2)
+            sp = rng.uniform(2.5, 7.0)
+            self.sparks.append({'x': x, 'y': y, 'vx': math.cos(a) * sp, 'vy': math.sin(a) * sp - 1.5,
+                                'life': rng.randint(18, 34)})
+        # Осколки породы летят в игровую систему частиц
+        if parts is not None:
+            for i in range(max(6, int(radius / 4))):
+                a = rng.uniform(math.pi, math.pi * 2)
+                sp = rng.uniform(2, 6)
+                parts.append({'x': x, 'y': y, 'vx': math.cos(a) * sp, 'vy': math.sin(a) * sp,
+                              'life': rng.randint(25, 45),
+                              'color': rng.choice([(90, 70, 50), (120, 95, 65), (70, 55, 40), (140, 120, 90)])})
+
+    def update(self):
+        self.t += 1
+        for s in self.smoke:
+            if self.t > s['delay']:
+                s['x'] += s['vx']; s['y'] += s['vy']; s['vy'] -= 0.015; s['vx'] *= 0.985; s['r'] += 0.55
+        for p in self.sparks:
+            p['x'] += p['vx']; p['y'] += p['vy']; p['vy'] += 0.25; p['vx'] *= 0.97; p['life'] -= 1
+        return self.t < self.duration
+
+    def draw(self, surface, cam_x, cam_y):
+        k = self.t / self.duration
+        sx, sy = int(self.x - cam_x), int(self.y - cam_y)
+        layer = _additive_layer(surface.get_size())
+
+        # ★ Воронка — тёмное кольцо кратера (мультипликативно)
+        if k < 0.6:
+            crater_a = int(120 * (1 - k / 0.6))
+            cs = pygame.Surface((int(self.r * 2.2), int(self.r * 2.2)), pygame.SRCALPHA)
+            pygame.draw.circle(cs, (40, 30, 25, crater_a), cs.get_rect().center, int(self.r * 1.05))
+            pygame.draw.circle(cs, (0, 0, 0, 0), cs.get_rect().center, int(self.r * 0.55))
+            ring = pygame.Surface(cs.get_size(), pygame.SRCALPHA)
+            pygame.draw.circle(ring, (25, 15, 10, crater_a), ring.get_rect().center, int(self.r * 1.05),
+                               max(2, int(self.r * 0.18)))
+            cs.blit(ring, (0, 0), special_flags=pygame.BLEND_ALPHA_SDL2)
+            surface.blit(cs, (sx - cs.get_width() // 2, sy - cs.get_height() // 2))
+
+        # ★ Вспышка (первые кадры)
+        if self.t < 8:
+            fk = 1 - self.t / 8
+            glow_dot(layer, sx, sy, self.flash_r * (0.4 + fk * 0.6), (255, 230, 160), int(255 * fk))
+        # ★ Огненный шар сжимается к центру и гаснет
+        if k < 0.55:
+            fire_k = k / 0.55
+            fr = self.r * (1.35 - fire_k * 0.9)
+            glow_dot(layer, sx, sy, fr, (255, 90, 20), int(230 * (1 - fire_k)))
+            glow_dot(layer, sx, sy, fr * 0.6, (255, 200, 60), int(240 * (1 - fire_k)))
+            glow_dot(layer, sx, sy, fr * 0.3, (255, 255, 220), int(250 * (1 - fire_k)))
+        # ★ Ударная волна — расходящееся кольцо
+        if k < 0.7:
+            wk = k / 0.7
+            wr = self.wave_r * wk
+            alpha = int(200 * (1 - wk))
+            rad = max(2, int(wr * 2))
+            ws = pygame.Surface((rad, rad), pygame.SRCALPHA)
+            pygame.draw.circle(ws, (255, 240, 210, alpha), (rad // 2, rad // 2), rad // 2,
+                               max(1, int(6 * (1 - wk))))
+            layer.blit(ws, (sx - rad // 2, sy - rad // 2), special_flags=pygame.BLEND_PREMULTIPLIED)
+        # ★ Искры-светлячки
+        for p in self.sparks:
+            if p['life'] > 0:
+                glow_dot(layer, p['x'] - cam_x, p['y'] - cam_y, 3, (255, 190, 90), min(255, p['life'] * 9))
+        surface.blit(layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+        # ★ Дым — обычный альфа-слой поверх
+        if k > 0.12:
+            ds = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+            for s in self.smoke:
+                if self.t > s['delay']:
+                    dk = min(1.0, (self.t - s['delay']) / (self.duration - s['delay']))
+                    da = int(110 * (1 - dk))
+                    gray = 70 + int(dk * 60)
+                    dr = max(2, int(s['r']))
+                    dsm = pygame.Surface((dr * 2, dr * 2), pygame.SRCALPHA)
+                    pygame.draw.circle(dsm, (gray, gray, gray, da), (dr, dr), dr)
+                    ds.blit(dsm, (int(s['x'] - cam_x) - dr, int(s['y'] - cam_y) - dr))
+            surface.blit(ds, (0, 0))
+
+
 def draw_trail(surface, trail, color, cam_x, cam_y):
     if len(trail) < 2: return
+    layer = _additive_layer(surface.get_size())
     for i in range(1, len(trail)):
         alpha = i / len(trail)
         c = tuple(int(color[j] * alpha) for j in range(3))
@@ -422,6 +647,10 @@ def draw_trail(surface, trail, color, cam_x, cam_y):
         pygame.draw.line(surface, c,
                          (int(trail[i - 1][0] - cam_x), int(trail[i - 1][1] - cam_y)),
                          (int(trail[i][0] - cam_x), int(trail[i][1] - cam_y)), thickness)
+        if i % 3 == 0:
+            glow_dot(layer, int(trail[i][0] - cam_x), int(trail[i][1] - cam_y), 5 * alpha + 2, color,
+                     int(90 * alpha))
+    surface.blit(layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
 
 # ======== ★ НОВАЯ МЕХАНИКА ДВИЖЕНИЯ С КАРАБКАНЬЕМ ========
@@ -572,13 +801,58 @@ def show_setup_menu():
         clock.tick(60)
 
 
+def make_sky_surface(width, height, sky_top, sky_bottom):
+    """★ Небо: вертикальный градиент + лёгкий у-шум + звёзды в верхней части."""
+    sky = pygame.Surface((width, height))
+    for y in range(height):
+        r = y / height
+        # Нелинейный градиент — сверху насыщеннее
+        rr = r ** 0.85
+        c = (int(sky_top[0] * (1 - rr) + sky_bottom[0] * rr),
+             int(sky_top[1] * (1 - rr) + sky_bottom[1] * rr),
+             int(sky_top[2] * (1 - rr) + sky_bottom[2] * rr))
+        pygame.draw.line(sky, c, (0, y), (width, y))
+    rng = random.Random(42)
+    for _ in range(int(width * height / 9000)):
+        sxp, syp = rng.randint(0, width - 1), rng.randint(0, int(height * 0.55))
+        br = rng.randint(120, 235)
+        sz = 1 if rng.random() < 0.7 else 2
+        pygame.draw.circle(sky, (br, br, min(255, br + 20)), (sxp, syp), sz)
+    return sky
+
+
+def draw_mountains_parallax(surface, cam_x, layer_seed, base_y, color, scale_x, height_amp):
+    """★ Дальние горы с параллаксом (рисуются за terrain)."""
+    rng = random.Random(layer_seed)
+    pts = [(x, base_y - abs(math.sin(x * 0.004 + layer_seed) * height_amp
+                            + math.sin(x * 0.011 + layer_seed * 2) * height_amp * 0.5)
+            - rng.random() * 6)
+           for x in range(-100, SCREEN_W + 101, 24)]
+    shifted = [(px - cam_x * scale_x, py) for px, py in pts]
+    poly = shifted + [(SCREEN_W + 100, surface.get_height()), (-100, surface.get_height())]
+    pygame.draw.polygon(surface, color, poly)
+
+
 def draw_clouds(surface, cam_x, cam_y, t):
-    for bx, by, sz in [(100, 50, 80), (400, 80, 60), (700, 40, 90), (1000, 70, 70), (1300, 50, 85)]:
-        cx = ((bx + t * 8) % (WIDTH + 200)) - 100 - int(cam_x)
-        cy = by - int(cam_y)
-        if -150 < cx < SCREEN_W + 50:
-            pygame.draw.ellipse(surface, (255, 255, 255), (cx, cy, sz, sz // 2))
-            pygame.draw.ellipse(surface, (255, 255, 255), (cx + sz // 3, cy - sz // 4, sz // 2, sz // 2))
+    """★ Объёмные облака с тенью и параллаксом (2 слоя)."""
+    for speed, scale_x, alpha_c, shadow_c, lst in [
+            (8, 1.0, (255, 255, 255), (210, 220, 235),
+             [(100, 50, 80), (400, 80, 60), (700, 40, 90), (1000, 70, 70), (1300, 50, 85)]),
+            (14, 1.0, (235, 240, 250), (195, 205, 225),
+             [(250, 120, 55), (850, 130, 65), (1150, 110, 50)])]:
+        for bx, by, sz in lst:
+            cx = ((bx + t * speed) % (WIDTH + 200)) - 100 - int(cam_x * scale_x)
+            cy = by - int(cam_y * 0.5)
+            if -150 < cx < SCREEN_W + 50:
+                # тень снизу
+                pygame.draw.ellipse(surface, shadow_c, (cx, cy + 4, sz, sz // 2))
+                pygame.draw.ellipse(surface, shadow_c, (cx + sz // 3, cy - sz // 4 + 4, sz // 2, sz // 2))
+                # тело
+                pygame.draw.ellipse(surface, alpha_c, (cx, cy, sz, sz // 2))
+                pygame.draw.ellipse(surface, alpha_c, (cx + sz // 3, cy - sz // 4, sz // 2, sz // 2))
+                # блик сверху
+                hl = tuple(min(255, c + 0) for c in (255, 255, 255))
+                pygame.draw.ellipse(surface, hl, (cx + sz // 6, cy - 2, sz // 2, sz // 4))
 
 
 def show_victory_screen(winner_team, teams):
@@ -627,11 +901,18 @@ def reset_game():
     terrain, sp = sm["generator"](WIDTH, HEIGHT)
     st, sb = sm["sky_top"], sm["sky_bottom"]
 
-    sky = pygame.Surface((WIDTH, HEIGHT))
-    for y in range(HEIGHT):
-        r = y / HEIGHT
-        c = (int(st[0] * (1 - r) + sb[0] * r), int(st[1] * (1 - r) + sb[1] * r), int(st[2] * (1 - r) + sb[2] * r))
-        pygame.draw.line(sky, c, (0, y), (WIDTH, y))
+    sky = make_sky_surface(WIDTH, HEIGHT, st, sb)
+    # ★ Скроллящийся декоративный слой: силуэты дальних холмов + деревья на горизонте
+    scroll_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    _rng = random.Random(7)
+    for hx in range(0, WIDTH, 60):
+        hy = int(HEIGHT * 0.52 + math.sin(hx * 0.012 + 2) * 45 + _rng.uniform(-8, 8))
+        pygame.draw.ellipse(scroll_surf, (40, 62, 92, 170), (hx - 90, hy, 220, 160))
+    for tx in range(40, WIDTH, 90):
+        ty = int(HEIGHT * 0.58 + math.sin(tx * 0.02) * 25)
+        if _rng.random() < 0.7:
+            pygame.draw.rect(scroll_surf, (28, 44, 60, 200), (tx, ty, 4, 14))
+            pygame.draw.circle(scroll_surf, (34, 66, 48, 200), (tx + 2, ty - 4), 11)
 
     teams = [{"name": TEAM_NAMES[t], "color": TEAM_COLORS[t]} for t in range(nt)]
     worms = []
@@ -652,17 +933,19 @@ def reset_game():
             worms.append(Worm(x, y, t, WORM_NAMES[t][i], TEAM_COLORS[t], d))
 
     loadout = {w: {wn: wd['ammo'] for wn, wd in WEAPONS.items()} for w in worms}
-    return terrain, sp, sky, st, sb, teams, worms, nt, loadout
+    return terrain, sp, sky, scroll_surf, teams, worms, nt, loadout, sm
 
 
 def main():
-    terrain, spawn_points, sky, sky_top, sky_bottom, teams, worms, num_teams, loadout = reset_game()
+    terrain, spawn_points, sky, scroll_surf, teams, worms, num_teams, loadout, map_data = reset_game()
 
     ct, cwi = 0, 0
     phase = 'aiming'
     power = 0.0
     wind = random.uniform(-0.08, 0.08)
     projs, parts, dtexts = [], [], []
+    fxs = []  # ★ Эффекты взрывов
+    shake = {'t': 0, 'mag': 0}  # ★ Тряска камеры
     sel_wp = 'bazooka'
     timer = 45 * 60
     cam_x, cam_y = 0.0, 0.0
@@ -688,6 +971,8 @@ def main():
         terrain.carve_circle(cx, cy, br)
         damage_worms(worms, parts, dtexts, cx, cy, br, dmg)
         boom_particles(parts, cx, cy)
+        fxs.append(ExplosionFX(cx, cy, br, parts))
+        shake['t'] = max(shake['t'], min(18, 6 + br / 8))  # ★ Тряска камеры от взрыва
 
     def fire_shotgun(worm):
         wp = WEAPONS['shotgun']
@@ -974,6 +1259,8 @@ def main():
             if p.x < -50 or p.x > WIDTH + 50 or p.y > HEIGHT + 50: p.active = False
 
         projs = [p for p in projs if p.active]
+        fxs = [fx for fx in fxs if fx.update()]
+        if shake['t'] > 0: shake['t'] -= 1
         for p in parts: p['x'] += p['vx']; p['y'] += p['vy']; p['vy'] += 0.1; p['life'] -= 1
         parts = [p for p in parts if p['life'] > 0]
         for d in dtexts: d['y'] -= 0.5; d['life'] -= 1
@@ -984,9 +1271,10 @@ def main():
             if len(at) <= 1:
                 winner = list(at)[0] if at else None
                 show_victory_screen(winner, teams)
-                terrain, spawn_points, sky, sky_top, sky_bottom, teams, worms, num_teams, loadout = reset_game()
+                terrain, spawn_points, sky, scroll_surf, teams, worms, num_teams, loadout, map_data = reset_game()
                 ct, cwi, phase = 0, 0, 'aiming'
-                projs, parts, dtexts = [], [], []
+                projs, parts, dtexts, fxs = [], [], [], []
+                shake['t'] = 0
                 timer = 45 * 60;
                 wind = random.uniform(-0.08, 0.08)
             else:
@@ -1000,22 +1288,45 @@ def main():
             cam_y = max(0, min(HEIGHT - SCREEN_H, cam_y))
 
         # РЕНДЕР
-        screen.blit(sky, (-int(cam_x), -int(cam_y)))
+        sx_off = sy_off = 0
+        if shake['t'] > 0:  # ★ Тряска камеры
+            m = shake['t'] * 0.55
+            sx_off = random.uniform(-m, m); sy_off = random.uniform(-m, m)
+        scr = scroll_surf.get_rect()
+        scr.x = -(int(cam_x * 0.4) % WIDTH); scr.y = -(int(cam_y * 0.4) % HEIGHT)
+        for dx in range(0, SCREEN_W + WIDTH, WIDTH):
+            for dy in range(0, SCREEN_H + HEIGHT, HEIGHT):
+                screen.blit(scroll_surf, (scr.x + dx, scr.y + dy))
+        # ★ Дальние горы (параллакс)
+        base_my = WATER_LEVEL - int(cam_y * 0.55) + 40
+        draw_mountains_parallax(screen, cam_x, 3.7, base_my, map_data['mountain_far'], 0.35, 130)
+        draw_mountains_parallax(screen, cam_x, 8.2, base_my + 35, map_data['mountain_near'], 0.55, 90)
         draw_clouds(screen, cam_x, cam_y, pygame.time.get_ticks() / 1000)
-        sun_x, sun_y = 100 - int(cam_x), 60 - int(cam_y)
-        if -50 < sun_x < SCREEN_W + 50:
-            pygame.draw.circle(screen, (255, 240, 150), (sun_x, sun_y), 30)
+        sun_x, sun_y = 100 - int(cam_x * 0.4), 60 - int(cam_y * 0.4)
+        if -80 < sun_x < SCREEN_W + 80:
+            pulse = 1 + math.sin(pygame.time.get_ticks() / 900) * 0.06
+            draw_glow_circle(screen, (sun_x, sun_y), int(75 * pulse), (255, 210, 90), core_alpha=90)
+            pygame.draw.circle(screen, (255, 246, 190), (sun_x, sun_y), 26)
+            pygame.draw.circle(screen, (255, 255, 235), (sun_x - 6, sun_y - 6), 12)
 
         wsy = WATER_LEVEL - int(cam_y)
         if wsy < SCREEN_H:
             t = pygame.time.get_ticks() / 1000
-            for x in range(0, SCREEN_W, 6):
-                wo = math.sin((x + cam_x) * 0.03 + t * 2) * 3
-                wy = wsy + wo;
-                d = min(80, SCREEN_H - wy)
+            wtop = max(0, wsy)
+            wat = pygame.Surface((SCREEN_W, max(1, SCREEN_H - wtop)), pygame.SRCALPHA)
+            for x in range(0, SCREEN_W, 4):
+                wo = math.sin((x + cam_x) * 0.03 + t * 2) * 3 + math.sin((x + cam_x) * 0.011 - t * 1.3) * 2
+                wy = wsy + wo
+                d = min(80, SCREEN_H - int(wy))
                 if d > 0:
-                    pygame.draw.rect(screen, (0, min(255, 80 + int(d * 2)), 200), (x, wy, 6, d))
-                    if int(x + cam_x) % 40 < 3: pygame.draw.rect(screen, (150, 200, 255), (x, wy, 3, 1))
+                    yy = int(wy) - wsy
+                    pygame.draw.line(wat, (30, 120, 210, 150), (x, yy), (x, yy + min(6, d)))
+                    if d > 6:
+                        pygame.draw.rect(wat, (0, 45, 120, 215), (x, yy + 6, 4, d - 6))
+                    foam = 0.5 + 0.5 * math.sin((x + cam_x) * 0.08 + t * 3.5)  # ★ пенная кромка
+                    if foam > 0.75:
+                        pygame.draw.line(wat, (225, 245, 255, int(120 * foam)), (x, yy), (x, yy + 2))
+            screen.blit(wat, (0, wtop))
 
         screen.blit(terrain.get_surface(), (-int(cam_x), -int(cam_y)))
 
@@ -1028,29 +1339,62 @@ def main():
             sx, sy = int(p.x - cam_x), int(p.y - cam_y)
             if sx < -20 or sx > SCREEN_W + 20 or sy < -20 or sy > SCREEN_H + 20: continue
             if p.type == 'mine' and p.active:
-                pygame.draw.circle(screen, (100, 100, 100), (sx, sy), 6)
+                pygame.draw.circle(screen, (95, 95, 100), (sx, sy), 6)
+                pygame.draw.circle(screen, (150, 150, 158), (sx - 2, sy - 2), 2)
                 pygame.draw.circle(screen, (255, 0, 0), (sx, sy), 6, 1)
                 if p.armed:
-                    if pygame.time.get_ticks() % 500 < 250: pygame.draw.circle(screen, (255, 0, 0), (sx, sy), 8)
+                    blink = pygame.time.get_ticks() % 500 < 250
+                    if blink:
+                        draw_glow_circle(screen, (sx, sy), 14, (255, 40, 40), core_alpha=170)
+                    pygame.draw.circle(screen, (255, 60, 60) if blink else (140, 20, 20), (sx, sy - 7), 2)
                 else:
                     pr = 1 - p.arm_timer / 90
                     pygame.draw.arc(screen, (0, 255, 0), (sx - 8, sy - 8, 16, 16), -math.pi / 2,
                                     -math.pi / 2 + pr * math.pi * 2, 2)
             elif p.type == 'air_strike':
-                pygame.draw.rect(screen, (50, 50, 50), (sx - 3, sy - 6, 6, 12))
+                ang = math.atan2(p.vy, p.vx)
+                hb = pygame.Surface((14, 8), pygame.SRCALPHA)
+                pygame.draw.ellipse(hb, (70, 72, 78), (0, 1, 13, 6))
+                pygame.draw.polygon(hb, (95, 98, 105), [(1, 1), (5, 0), (5, 3)])
+                pygame.draw.circle(hb, (255, 120, 60), (1, 4), 2)
+                screen.blit(pygame.transform.rotozoom(hb, -math.degrees(ang), 1.0), (sx - 8, sy - 5))
+                draw_glow_circle(screen, (sx - int(math.cos(ang) * 8), sy - int(math.sin(ang) * 8)),
+                                 6, (255, 140, 50), core_alpha=150)
             elif p.type == 'banana':
-                pygame.draw.circle(screen, (255, 255, 0), (sx, sy), 7)
+                rot = pygame.time.get_ticks() / 8 % 360
+                bs = pygame.Surface((18, 18), pygame.SRCALPHA)
+                pygame.draw.arc(bs, (255, 220, 60), (2, 2, 14, 14), math.pi * 0.15, math.pi * 0.95, 5)
+                pygame.draw.arc(bs, (255, 245, 150), (2, 2, 14, 14), math.pi * 0.3, math.pi * 0.8, 2)
+                pygame.draw.circle(bs, (120, 90, 30), (4, 12), 2)
+                screen.blit(pygame.transform.rotate(bs, rot), (sx - 9, sy - 9))
+                draw_glow_circle(screen, (sx, sy), 12, (255, 240, 80), core_alpha=110)
             elif p.type == 'grenade':
-                pygame.draw.circle(screen, (50, 50, 50), (sx, sy), 5)
-                if p.timer < 60 and pygame.time.get_ticks() % 200 < 100: pygame.draw.circle(screen, (255, 0, 0),
-                                                                                            (sx, sy), 6)
+                pygame.draw.circle(screen, (55, 58, 55), (sx, sy), 5)
+                pygame.draw.circle(screen, (110, 115, 110), (sx - 1, sy - 1), 2)
+                pygame.draw.rect(screen, (90, 90, 80), (sx - 1, sy - 7, 3, 3))
+                if p.timer < 60 and pygame.time.get_ticks() % 200 < 100:
+                    draw_glow_circle(screen, (sx, sy), 11, (255, 60, 30), core_alpha=190)
             else:
-                pygame.draw.circle(screen, (100, 100, 100), (sx, sy), 4)
+                ang = math.atan2(p.vy, p.vx)
+                rb = pygame.Surface((16, 6), pygame.SRCALPHA)
+                pygame.draw.ellipse(rb, (120, 122, 128), (0, 0, 16, 6))
+                pygame.draw.rect(rb, (70, 72, 78), (0, 1, 5, 4))
+                pygame.draw.circle(rb, (255, 200, 120), (14, 3), 2)
+                screen.blit(pygame.transform.rotate(rb, -math.degrees(ang)), (sx - 8, sy - 3))
+                draw_glow_circle(screen, (sx + int(math.cos(ang) * 6), sy + int(math.sin(ang) * 6)),
+                                 7, (255, 170, 70), core_alpha=170)
 
+        glow_layer = _additive_layer((SCREEN_W, SCREEN_H))
         for p in parts:
             sx, sy = int(p['x'] - cam_x), int(p['y'] - cam_y)
             if -10 < sx < SCREEN_W + 10 and -10 < sy < SCREEN_H + 10:
-                pygame.draw.circle(screen, p['color'], (sx, sy), max(1, int(3 * p['life'] / 30)))
+                sz = max(1, int(3 * p['life'] / 30))
+                pygame.draw.circle(screen, p['color'], (sx, sy), sz)
+                glow_dot(glow_layer, sx, sy, sz * 3, p['color'], min(200, p['life'] * 7))
+        screen.blit(glow_layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+        for fx in fxs:  # ★ Многослойные взрывы поверх сцены
+            fx.draw(screen, cam_x, cam_y)
 
         for w in worms: w.draw(screen, w == aw, cam_x, cam_y)
 
@@ -1063,17 +1407,42 @@ def main():
                 ex = sx + int(math.cos(aw.angle) * l * aw.direction);
                 ey = sy + int(math.sin(aw.angle) * l)
                 pygame.draw.line(screen, (255, 255, 255), (sx, sy), (ex, ey), 2)
+                # ★ Пунктир продолжения + пульсирующая точка прицела
+                vx, vy = math.cos(aw.angle) * aw.direction, math.sin(aw.angle)
+                for dd in range(int(l) + 8, int(l) + 130, 10):
+                    if (dd - int(l)) % 20 < 10:
+                        pygame.draw.circle(screen, (230, 230, 230), (sx + int(vx * dd), sy + int(vy * dd)), 1)
+                tx_, ty_ = sx + int(vx * (l + 140)), sy + int(vy * (l + 140))
+                rr = 3 + math.sin(pygame.time.get_ticks() / 40) * 1.2
+                pygame.draw.circle(screen, (255, 70, 70), (tx_, ty_), max(1, int(rr)), 1)
+                pygame.draw.circle(screen, (255, 70, 70), (tx_, ty_), 1)
             elif wp['type'] in ('hitscan', 'shotgun'):
                 l = 200
                 ex = sx + int(math.cos(aw.angle) * l * aw.direction);
                 ey = sy + int(math.sin(aw.angle) * l)
-                pygame.draw.line(screen, (255, 50, 50), (sx, sy), (ex, ey), 1)
+                gl = _additive_layer((SCREEN_W, SCREEN_H))
+                glow_dot(gl, ex, ey, 8, (255, 60, 60), core_alpha=120)
+                seg = 6
+                for i in range(0, l, seg * 2):
+                    x1 = sx + int(math.cos(aw.angle) * i * aw.direction)
+                    y1 = sy + int(math.sin(aw.angle) * i)
+                    x2 = sx + int(math.cos(aw.angle) * min(i + seg, l) * aw.direction)
+                    y2 = sy + int(math.sin(aw.angle) * min(i + seg, l))
+                    pygame.draw.line(screen, (255, 50, 50), (x1, y1), (x2, y2), 1)
+                screen.blit(gl, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+        if sx_off or sy_off:
+            screen.scroll(sx_off, sy_off)  # ★ Тряска: сдвигаем мир, HUD остаётся стабильным
 
         font = pygame.font.Font(None, 22);
         fs = pygame.font.Font(None, 16)
-        pygame.draw.rect(screen, (0, 0, 0), (0, 0, SCREEN_W, 45))
-        pygame.draw.rect(screen, teams[ct]['color'], (10, 8, 28, 28))
-        pygame.draw.rect(screen, (255, 255, 255), (10, 8, 28, 28), 2)
+        # ★ Полупрозрачные панели HUD
+        hud = pygame.Surface((SCREEN_W, 48), pygame.SRCALPHA)
+        hud.fill((8, 10, 22, 195))
+        screen.blit(hud, (0, 0))
+        pygame.draw.line(screen, tuple(min(255, c + 60) for c in teams[ct]['color']), (0, 47), (SCREEN_W, 47), 2)
+        pygame.draw.rect(screen, teams[ct]['color'], (10, 8, 28, 28), border_radius=6)
+        pygame.draw.rect(screen, (255, 255, 255), (10, 8, 28, 28), 2, border_radius=6)
         screen.blit(font.render(teams[ct]['name'], True, (255, 255, 255)), (45, 10))
         tc = (255, 100, 100) if timer // 60 < 10 else (255, 255, 255)
         screen.blit(font.render(f"Time: {timer // 60}s", True, tc), (SCREEN_W // 2 - 40, 5))
@@ -1082,13 +1451,20 @@ def main():
         for t in range(num_teams):
             th = sum(w.health for w in worms if w.team == t and w.alive)
             ac = sum(1 for w in worms if w.team == t and w.alive)
-            tx = SCREEN_W - 140;
-            ty = 8 + t * 14
-            pygame.draw.rect(screen, TEAM_COLORS[t], (tx, ty, 8, 8))
+            tx = SCREEN_W - 170;
+            ty = 6 + t * 14
+            pygame.draw.rect(screen, TEAM_COLORS[t], (tx, ty, 8, 8), border_radius=2)
+            barw = int(60 * th / max(1, 300))
+            pygame.draw.rect(screen, (40, 40, 55), (tx + 52, ty + 1, 60, 6), border_radius=3)
+            if barw > 0:
+                pygame.draw.rect(screen, TEAM_COLORS[t], (tx + 52, ty + 1, barw, 6), border_radius=3)
             screen.blit(fs.render(f"{th}hp ({ac})", True, (200, 200, 200)), (tx + 12, ty - 2))
 
         py_h = SCREEN_H - 50
-        pygame.draw.rect(screen, (0, 0, 0), (0, py_h, SCREEN_W, 50))
+        panel = pygame.Surface((SCREEN_W, 50), pygame.SRCALPHA)
+        panel.fill((8, 10, 22, 205))
+        screen.blit(panel, (0, py_h))
+        pygame.draw.line(screen, (90, 100, 150), (0, py_h), (SCREEN_W, py_h), 1)
         wl = list(WEAPONS.keys());
         ws = 100;
         wx0 = SCREEN_W // 2 - len(wl) * ws // 2
@@ -1099,8 +1475,9 @@ def main():
             wy = py_h + 4
             sel = (wn == sel_wp);
             am = loadout[worm].get(wn, 0) if worm else 0
-            pygame.draw.rect(screen, (80, 80, 120) if sel else (60, 60, 80), (wx, wy, 90, 40))
-            if sel: pygame.draw.rect(screen, (255, 215, 0), (wx, wy, 90, 40), 2)
+            pygame.draw.rect(screen, (85, 90, 140) if sel else (52, 55, 78), (wx, wy, 90, 40), border_radius=7)
+            if sel:
+                pygame.draw.rect(screen, (255, 215, 0), (wx, wy, 90, 40), 2, border_radius=7)
             nc = (255, 255, 255) if am != 0 else (100, 100, 100)
             screen.blit(fs.render(f"{i + 1}:{wd['name'][:8]}", True, nc), (wx + 4, wy + 2))
             at = "inf" if am == -1 else f"x{am}" if am > 0 else "empty"
@@ -1111,15 +1488,28 @@ def main():
                     (10, py_h + 36))
 
         if phase == 'power':
-            pygame.draw.rect(screen, (50, 50, 50), (SCREEN_W // 2 - 60, 50, 120, 12))
-            bw = int(power / 100 * 118)
-            c = (0, 255, 0) if power < 33 else (255, 255, 0) if power < 66 else (255, 100, 0)
-            pygame.draw.rect(screen, c, (SCREEN_W // 2 - 59, 51, bw, 10))
+            pygame.draw.rect(screen, (30, 30, 40), (SCREEN_W // 2 - 62, 52, 124, 16), border_radius=8)
+            pygame.draw.rect(screen, (120, 120, 140), (SCREEN_W // 2 - 62, 52, 124, 16), 1, border_radius=8)
+            bw = int(power / 100 * 120)
+            pc_bar = pygame.Surface((120, 12), pygame.SRCALPHA)
+            for xx in range(bw):
+                frac = xx / 120
+                colr = (int(255 * min(1, frac * 2)), int(255 * min(1, (1 - frac) * 2 + 0.4)), 40)
+                pygame.draw.line(pc_bar, (*colr, 235), (xx, 0), (xx, 11))
+            screen.blit(pc_bar, (SCREEN_W // 2 - 60, 54))
+            pygame.draw.line(screen, (255, 255, 255), (SCREEN_W // 2 - 61 + bw, 52),
+                             (SCREEN_W // 2 - 61 + bw, 68), 2)
 
         for d in dtexts:
             sx, sy = int(d['x'] - cam_x), int(d['y'] - cam_y)
-            tf = pygame.font.Font(None, 20)
+            kf = d['life'] / d['max_life']  # 1 -> 0
+            pop = 1.4 if kf > 0.9 else 1.0 + 0.25 * math.sin(kf * 12)
+            tf = pygame.font.Font(None, max(12, int(20 * pop)))
             txt = tf.render(d['text'], True, d['color'])
+            shd = tf.render(d['text'], True, (0, 0, 0))
+            a = min(255, int(255 * min(1.0, kf * 2.5)))
+            txt.set_alpha(a); shd.set_alpha(a)
+            screen.blit(shd, (sx - shd.get_width() // 2 + 1, sy + 1))
             screen.blit(txt, (sx - txt.get_width() // 2, sy))
 
         pygame.display.flip()
